@@ -2,6 +2,14 @@ from telegram import (Update, ReplyKeyboardMarkup, ReplyKeyboardRemove, InlineKe
 from telegram.ext import (Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, CallbackContext, InlineQueryHandler,)
 from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut
+import osmnx as ox
+import folium
+from io import BytesIO
+import requests
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # TODO: нормальные типы музеев + нормальные города
 # TODO: база данных музеев с метками "пушкинская карта" ...
@@ -21,6 +29,8 @@ TOKEN = '7397155961:AAE5Uagw13oQlR5UnFz8wkXVCyQkU8-loy4'
 
 CITIES = ["Санкт-Петербург", "Самара", "Саратов", "Сан-Франциско", "Сан-Диего"] # примеры городов
 MUSEUM_TYPES = ["Исторический", "Художественный", "Научный", "Технический", "Военный"] # примеры типов
+
+start_lon, start_lat = 30.3146, 59.9398 #эрмитаж
 
 async def start(update: Update, context: CallbackContext) -> None: # выбор способа определения города
     context.user_data['state']='start'
@@ -108,16 +118,86 @@ async def handle_location(update: Update, context: CallbackContext) -> None: # �
         await start(update, context)  # Возвращаем пользователя в начало
         return
 
+    context.user_data["user_lat"] = latitude
+    context.user_data["user_lon"] = longitude
     context.user_data["selected_city"] = city
     context.user_data["selected_museums"] = set()
     
-    keyboard = [[InlineKeyboardButton(museum, callback_data=f"museum_{museum}")] for museum in MUSEUM_TYPES]
-    keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="done")])
-    keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])  # Кнопка "Назад"
-    
-    await update.message.reply_text(f"Определен город: {city}. Теперь выберите тип музея:", 
-                                    reply_markup=InlineKeyboardMarkup(keyboard))
 
+    keyboard = [
+        #[InlineKeyboardButton(museum, callback_data=f"museum_{museum}") for museum in MUSEUM_TYPES],
+        # клавиатура из ближайших музеев
+        [InlineKeyboardButton("📍 Построить маршрут", callback_data="route_to")],  # Новая кнопка
+        [InlineKeyboardButton("🔙 Назад", callback_data="back")]
+    ]
+    
+    await update.message.reply_text(
+        f"Определен город: {city}. Теперь выберите тип музея:",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    #keyboard = [[InlineKeyboardButton(museum, callback_data=f"museum_{museum}")] for museum in MUSEUM_TYPES]
+    #keyboard.append([InlineKeyboardButton("✅ Готово", callback_data="done")])
+    #keyboard.append([InlineKeyboardButton("🔙 Назад", callback_data="back")])  # Кнопка "Назад"
+    
+    #await update.message.reply_text(f"Определен город: {city}. Теперь выберите тип музея:", 
+      #                              reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def calculate_route(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    
+    try:
+        await query.answer()
+        user_lat = context.user_data.get("user_lat")
+        user_lon = context.user_data.get("user_lon")
+        city = context.user_data.get("city")
+
+        if not user_lat or not user_lon:
+            await update.message.reply_text("Не удалось получить вашу геопозицию.")
+            return
+
+   
+        osrm_url = f"http://router.project-osrm.org/route/v1/driving/{user_lon},{user_lat};{start_lon},{start_lat}?overview=full&geometries=geojson"
+
+        # Отправляем запрос к OSRM
+        response = requests.get(osrm_url)
+        if response.status_code != 200:
+            await query.message.reply_text("Ошибка при расчете маршрута через OSRM.")
+            return
+
+        # Парсим ответ
+        route_data = response.json()
+        if route_data.get("code") != "Ok":
+            await query.message.reply_text("Не удалось построить маршрут.")
+            return
+
+        # Получаем координаты маршрута
+        route_coords = route_data["routes"][0]["geometry"]["coordinates"]
+        route_coords = [(lat, lon) for lon, lat in route_coords]  # Преобразуем в (lat, lon)
+
+        # Создаем карту с помощью folium
+        route_map = folium.Map(location=[user_lat, user_lon], zoom_start=14)
+
+        # Добавляем маршрут на карту
+        folium.PolyLine(route_coords, color="blue", weight=5, opacity=0.7).add_to(route_map)
+
+        # Сохраняем карту в виде HTML
+        map_html = "route_map.html"
+        route_map.save(map_html)
+
+        # Отправляем карту в Telegram
+        with open(map_html, "rb") as file:
+            await query.message.reply_document(document=file, caption=f"Маршрут из {city} до Эрмитажа")
+
+        # Также можно предложить перейти в OpenStreetMap
+        osm_link = f"https://www.openstreetmap.org/directions?engine=osrm_car&route={user_lat}%2C{user_lon}%3B{start_lat}%2C{start_lon}"
+        await query.message.reply_text(
+            f"Вы также можете посмотреть маршрут на [OpenStreetMap]({osm_link}).",
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        # Обработка ошибок
+        logger.error(f"Ошибка при расчете маршрута: {e}")
+        await query.message.reply_text(f"Произошла ошибка при расчете маршрута: {e}")
 
 async def handle_city_choice(update: Update, context: CallbackContext) -> None: # обрабатывает выбор города и предлагает выбрать тип музея
  
@@ -173,6 +253,7 @@ async def handle_museum_choice(update: Update, context: CallbackContext) -> None
     await query.message.edit_text("Выберите тип музея (можно несколько):", reply_markup=InlineKeyboardMarkup(keyboard))
 
 
+
 async def help_command(update: Update, context: CallbackContext) -> None:
     help_text = (
         "🤖 *Как пользоваться ботом?*\n\n"
@@ -195,6 +276,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_museum_choice, pattern="^(museum_|done|back)"))
     app.add_handler(CommandHandler('help', help_command))
     app.add_handler(InlineQueryHandler(inline_query_handler))  
+    app.add_handler(CallbackQueryHandler(calculate_route, pattern="^route_to"))
 
     app.run_polling()
 
